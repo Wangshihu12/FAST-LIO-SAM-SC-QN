@@ -135,65 +135,110 @@ RegistrationOutput LoopClosure::icpAlignment(const pcl::PointCloud<PointType> &s
     return reg_output;
 }
 
+/**
+ * @brief 使用粗到精的方式对两个点云进行配准。
+ *
+ * 此函数分为两步：
+ * 1. 使用 Quatro 算法进行粗配准，获得初步对齐的变换矩阵。
+ * 2. 使用 ICP（迭代最近点）算法进行精配准，以优化对齐结果。
+ *
+ * @param src 源点云，需要进行对齐的点云。
+ * @param dst 目标点云，作为对齐参考的点云。
+ * @return RegistrationOutput 包含对齐结果的结构体，包括最终变换矩阵和是否收敛的状态。
+ */
 RegistrationOutput LoopClosure::coarseToFineAlignment(const pcl::PointCloud<PointType> &src,
                                                       const pcl::PointCloud<PointType> &dst)
 {
-    RegistrationOutput reg_output;
-    coarse_aligned_.clear();
+    RegistrationOutput reg_output; // 用于存储配准结果的结构体。
+    coarse_aligned_.clear();       // 清空用于存储粗配准结果的点云。
 
+    // 第一步：使用 Quatro 算法进行粗配准。
     reg_output.pose_between_eig_ = (quatro_handler_->align(src, dst, reg_output.is_converged_));
+
+    // 检查粗配准是否收敛。
     if (!reg_output.is_converged_)
     {
+        // 如果配准失败，直接返回结果，标志未收敛。
         return reg_output;
     }
-    else // if valid,
+    else // 如果粗配准成功，
     {
-        // coarse align with the result of Quatro
+        // 第二步：基于 Quatro 的结果进行精配准。
+        // 将粗配准结果应用于源点云，生成粗配准后的点云。
         coarse_aligned_ = transformPcd(src, reg_output.pose_between_eig_);
+
+        // 使用 ICP 算法对粗配准结果进行优化。
         const auto &fine_output = icpAlignment(coarse_aligned_, dst);
+
+        // 保存 Quatro 算法的初步变换矩阵。
         const auto quatro_tf_ = reg_output.pose_between_eig_;
+
+        // 更新配准结果为精配准的输出。
         reg_output = fine_output;
+
+        // 合并粗配准（Quatro）和精配准（ICP）的变换矩阵，获得最终变换结果。
         reg_output.pose_between_eig_ = fine_output.pose_between_eig_ * quatro_tf_;
     }
+
+    // 返回最终的配准结果。
     return reg_output;
 }
 
+/**
+ * @brief 执行回环检测并进行点云配准
+ *
+ * 该函数通过将当前关键帧与历史关键帧进行比对，判断是否存在回环，并通过不同方法（Quatro + NANO-GICP 或 GICP）进行点云配准。
+ *
+ * @param query_keyframe 当前的查询关键帧，用于与历史关键帧进行比对。
+ * @param keyframes 历史关键帧集合。
+ * @param closest_keyframe_idx 与当前关键帧最近的历史关键帧索引。
+ * @return RegistrationOutput 包含配准结果的结构体，包括是否收敛和最终变换矩阵。
+ */
 RegistrationOutput LoopClosure::performLoopClosure(const PosePcd &query_keyframe,
                                                    const std::vector<PosePcd> &keyframes,
                                                    const int closest_keyframe_idx)
 {
-    RegistrationOutput reg_output;
-    closest_keyframe_idx_ = closest_keyframe_idx;
+    RegistrationOutput reg_output;                // 用于存储配准结果的结构体。
+    closest_keyframe_idx_ = closest_keyframe_idx; // 保存最近的历史关键帧索引。
+
+    // 检查最近的关键帧索引是否有效。
     if (closest_keyframe_idx_ >= 0)
     {
-        // Quatro + NANO-GICP to check loop (from front_keyframe to closest keyframe's neighbor)
+        // 调用函数生成源点云（src_cloud）和目标点云（dst_cloud）。
         const auto &[src_cloud, dst_cloud] = setSrcAndDstCloud(keyframes,
-                                                               query_keyframe.idx_,
-                                                               closest_keyframe_idx_,
-                                                               config_.num_submap_keyframes_,
-                                                               config_.voxel_res_,
-                                                               config_.enable_quatro_,
-                                                               config_.enable_submap_matching_);
-        // Only for visualization
+                                                               query_keyframe.idx_,              // 查询关键帧索引。
+                                                               closest_keyframe_idx_,            // 最近历史关键帧索引。
+                                                               config_.num_submap_keyframes_,    // 使用的子地图关键帧数量。
+                                                               config_.voxel_res_,               // 体素分辨率。
+                                                               config_.enable_quatro_,           // 是否启用 Quatro 粗配准。
+                                                               config_.enable_submap_matching_); // 是否启用子地图匹配。
+
+        // 将源点云和目标点云存储以便于可视化。
         *src_cloud_ = src_cloud;
         *dst_cloud_ = dst_cloud;
 
+        // 判断是否启用 Quatro 算法进行粗到精的配准。
         if (config_.enable_quatro_)
         {
+            // 输出调试信息，显示配准的点云规模。
             std::cout << "\033[1;35mExecute coarse-to-fine alignment: " << src_cloud.size()
                       << " vs " << dst_cloud.size() << "\033[0m\n";
+            // 调用粗到精配准方法进行点云对齐。
             return coarseToFineAlignment(src_cloud, dst_cloud);
         }
         else
         {
+            // 输出调试信息，显示配准的点云规模。
             std::cout << "\033[1;35mExecute GICP: " << src_cloud.size() << " vs "
                       << dst_cloud.size() << "\033[0m\n";
+            // 调用 GICP 算法进行点云对齐。
             return icpAlignment(src_cloud, dst_cloud);
         }
     }
     else
     {
-        return reg_output; // dummy output whose `is_valid` is false
+        // 如果没有有效的最近关键帧索引，返回默认无效的结果。
+        return reg_output; // 默认返回的结果中 `is_valid` 为 false。
     }
 }
 
